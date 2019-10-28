@@ -23,9 +23,6 @@ ifdef TEMP_CONFIG
 TEMP_CONF += --temp-config=$(TEMP_CONFIG)
 endif
 
-# Greenplum regression tests use $PGPORT
-PGPORT?=15432
-
 # maximum simultaneous connections for parallel tests
 MAXCONNOPT =
 ifdef MAX_CONNECTIONS
@@ -37,19 +34,13 @@ EXTRADEFS = '-DHOST_TUPLE="$(host_tuple)"' \
 	'-DSHELLPROG="$(SHELL)"' \
 	'-DDLSUFFIX="$(DLSUFFIX)"'
 
-
-# The frontend doesn't need everything that's in LIBS, some are backend only
-LIBS := $(filter-out -lresolv -lbz2, $(LIBS))
-# This program isn't interactive, so doesn't need these
-LIBS := $(filter-out -lreadline -ledit -ltermcap -lncurses -lcurses -lcurl -lssl -lz, $(LIBS))
-
 ##
 ## Prepare for tests
 ##
 
 # Build regression test driver
 
-all: pg_regress$(X)
+all: pg_regress$(X) scan_flaky_fault_injectors
 
 pg_regress$(X): pg_regress.o pg_regress_main.o $(WIN32RES) | submake-libpgport
 	$(CC) $(CFLAGS) $^ $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
@@ -59,6 +50,10 @@ pg_regress.o: pg_regress.c $(top_builddir)/src/port/pg_config_paths.h
 pg_regress.o: override CPPFLAGS += -I$(top_builddir)/src/port $(EXTRADEFS)
 regress_gp.o: override CFLAGS += -I$(top_builddir)/src/interfaces/libpq
 regress_gp.o: override LDFLAGS += -L$(top_builddir)/src/interfaces/libpq
+
+.PHONY: scan_flaky_fault_injectors
+scan_flaky_fault_injectors:
+	$(top_builddir)/src/test/regress/scan_flaky_fault_injectors.sh
 
 twophase_pqexecparams: twophase_pqexecparams.c
 	$(CC) $(CPPFLAGS) -I$(top_builddir)/src/interfaces/libpq -L$(GPHOME)/lib -L$(top_builddir)/src/interfaces/libpq  -o $@ $< -lpq
@@ -236,7 +231,7 @@ bigcheck: all tablespace-setup
 ## Clean up
 ##
 
-clean distclean maintainer-clean: clean-lib
+clean maintainer-clean: clean-lib
 # things built by `all' target
 	rm -f $(OBJS) refint$(DLSUFFIX) autoinc$(DLSUFFIX)
 	rm -f pg_regress_main.o pg_regress.o pg_regress$(X)
@@ -248,3 +243,6 @@ clean distclean maintainer-clean: clean-lib
 	rm -f $(output_files) $(input_files)
 	rm -rf ./testtablespace ./testtablespace_*
 	rm -rf $(pg_regress_clean_files)
+
+distclean: clean
+	rm -f GPTest.pm

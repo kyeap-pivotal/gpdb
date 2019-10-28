@@ -121,6 +121,7 @@ static bool fix_scan_expr_walker(Node *node, fix_scan_expr_context *context);
 static void set_join_references(PlannerInfo *root, Join *join, int rtoffset);
 static void set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset);
 static void set_dummy_tlist_references(Plan *plan, int rtoffset);
+static void set_splitupdate_tlist_references(Plan *plan, int rtoffset);
 static indexed_tlist *build_tlist_index(List *tlist);
 static Var *search_indexed_tlist_for_var(Var *var,
 							 indexed_tlist *itlist,
@@ -588,23 +589,6 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 	if (plan == NULL)
 		return NULL;
 
-    /*
-     * CDB: If plan has a Flow node, fix up its hashExpr to refer to the
-     * plan's own targetlist.
-     */
-	if (plan->flow && plan->flow->hashExprs)
-    {
-        indexed_tlist  *plan_itlist = build_tlist_index(plan->targetlist);
-
-		plan->flow->hashExprs =
-			(List *) fix_upper_expr(root,
-									(Node *) plan->flow->hashExprs,
-									plan_itlist,
-									OUTER_VAR,
-									rtoffset);
-        pfree(plan_itlist);
-    }
-
 	/*
 	 * Plan-type-specific fixes
 	 */
@@ -757,7 +741,6 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 
 				/* Need to look up the subquery's RelOptInfo, since we need its subroot */
 				rel = find_base_rel(root, tplan->scan.scanrelid);
-				Assert(rel->subplan == subplan);
 
 				/* recursively process the subplan */
 				plan->lefttree = set_plan_references(rel->subroot, subplan);
@@ -1230,18 +1213,6 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				motion->hashExprs = (List *)
 					fix_upper_expr(root, (Node*) motion->hashExprs, childplan_itlist,  OUTER_VAR, rtoffset);
 
-#ifdef USE_ASSERT_CHECKING
-				/* 1. Assert that the Motion node has same number of hash data types as that of hash expressions*/
-				/* 2. Motion node must have atleast one hash expression */
-				/* 3. If the Motion node is of type hash_motion: ensure that the expression that it is hashed on is a hashable datatype in gpdb*/
-
-				if (MOTIONTYPE_HASH == motion->motionType)
-				{
-					Assert(1 <= list_length(motion->hashExprs) && "Motion node must have atleast one hash expression!");
-				}
-
-#endif			/* USE_ASSERT_CHECKING */
-
 				/* no need to fix targetlist and qual */
 				Assert(plan->qual == NIL);
 				set_dummy_tlist_references(plan, rtoffset);
@@ -1249,10 +1220,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 			}
 			break;
 		case T_SplitUpdate:
-			/*
-			 * when we make the target list for SplitUpdate node, we
-			 * have used the OUTER as the varno, so we can skip to fix the varno.
-			 */
+			Assert(plan->qual == NIL);
+			set_splitupdate_tlist_references(plan, rtoffset);
 			break;
 		default:
 			elog(ERROR, "unrecognized node type: %d",
@@ -1378,6 +1347,7 @@ set_subqueryscan_references(PlannerInfo *root,
 
 		/* Honor the flow of the SubqueryScan, by copying it to the subplan. */
 		result->flow = plan->scan.plan.flow;
+		result->dispatch = plan->scan.plan.dispatch;
 	}
 	else
 	{
@@ -2125,6 +2095,67 @@ set_dummy_tlist_references(Plan *plan, int rtoffset)
 
 	/* We don't touch plan->qual here */
 }
+
+/*
+ * Split update is a bit special. It doesn't evaluate targetlist expressions,
+ * but it adds an extra DMLActionExpr attribute to the output. Also, because
+ * there is an assertion in ModifyTable that its subplan must contain a NULL
+ * Const for any dropped columns, we must represent NULL constants as Const
+ * node, even though they are passed through from the node below, rather than
+ * evaluated at the Split Update node. So this is mostly the same as
+ * set_dummy_tlist_references(), except for the special handling of
+ * DMLActionExpr and Consts.
+ */
+static void
+set_splitupdate_tlist_references(Plan *plan, int rtoffset)
+{
+	List	   *output_targetlist;
+	ListCell   *l;
+
+	output_targetlist = NIL;
+	foreach(l, plan->targetlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(l);
+		Var		   *oldvar = (Var *) tle->expr;
+		Var		   *newvar;
+
+		if (IsA(tle->expr, DMLActionExpr))
+		{
+			output_targetlist = lappend(output_targetlist, tle);
+			continue;
+		}
+		else if (IsA(tle->expr, Const))
+		{
+			output_targetlist = lappend(output_targetlist, tle);
+			continue;
+		}
+
+		newvar = makeVar(OUTER_VAR,
+						 tle->resno,
+						 exprType((Node *) oldvar),
+						 exprTypmod((Node *) oldvar),
+						 exprCollation((Node *) oldvar),
+						 0);
+		if (IsA(oldvar, Var))
+		{
+			newvar->varnoold = oldvar->varno + rtoffset;
+			newvar->varoattno = oldvar->varattno;
+		}
+		else
+		{
+			newvar->varnoold = 0;		/* wasn't ever a plain Var */
+			newvar->varoattno = 0;
+		}
+
+		tle = flatCopyTargetEntry(tle);
+		tle->expr = (Expr *) newvar;
+		output_targetlist = lappend(output_targetlist, tle);
+	}
+	plan->targetlist = output_targetlist;
+
+	/* We don't touch plan->qual here */
+}
+
 
 
 /*
@@ -2994,7 +3025,7 @@ cdb_extract_plan_dependencies_walker(Node *node, cdb_extract_plan_dependencies_c
 	fix_expr_common(context->root, node);
 
 	return plan_tree_walker(node, cdb_extract_plan_dependencies_walker,
-								  (void *) context);
+							(void *) context, true);
 }
 
 /*

@@ -114,9 +114,29 @@
 #define WRITE_LOCATION_FIELD(fldname) \
 	{ appendBinaryStringInfo(str, (const char *)&node->fldname, sizeof(int)); }
 
-/* Write a Node field */
+/*
+ * Write a Node field
+ *
+ * If compiled with GP_SERIALIZATION_DEBUG, write the field name in the
+ * serialized form, and check that it matches in the read function
+ * (READ_NODE_FIELD in readfast.c). That makes it much easier to debug bugs
+ * where the out and read functions are not in sync, as you get an error
+ * much earlier, and it can print the field name where the mismatch occurred.
+ * It makes the serialized plans much larger, though, so we don't want to do
+ * it production.
+ */
+#ifdef GP_SERIALIZATION_DEBUG
+#define WRITE_NODE_FIELD(fldname) \
+	do { \
+		const char *xx = CppAsString(fldname); \
+		appendBinaryStringInfo(str, xx, strlen(xx) + 1); \
+		(_outNode(str, node->fldname)); \
+	} while (0)
+#else
 #define WRITE_NODE_FIELD(fldname) \
 	(_outNode(str, node->fldname))
+#endif
+
 
 /* Write a bitmapset field */
 #define WRITE_BITMAPSET_FIELD(fldname) \
@@ -136,10 +156,10 @@
 
 	/* Read an integer array */
 #define WRITE_INT_ARRAY(fldname, count, Type) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		for(i = 0; i < count; i++) \
+		for(i = 0; i < (count); i++) \
 		{ \
 			appendBinaryStringInfo(str, (const char *)&node->fldname[i], sizeof(Type)); \
 		} \
@@ -147,10 +167,10 @@
 
 /* Write a boolean array  */
 #define WRITE_BOOL_ARRAY(fldname, count) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		for(i = 0; i < count; i++) \
+		for(i = 0; i < (count); i++) \
 		{ \
 			char b = node->fldname[i] ? 1 : 0;								\
 			appendBinaryStringInfo(str, (const char *)&b, 1); \
@@ -159,10 +179,10 @@
 
 /* Write an Trasnaction ID array  */
 #define WRITE_XID_ARRAY(fldname, count) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		for(i = 0; i < count; i++) \
+		for(i = 0; i < (count); i++) \
 		{ \
 			appendBinaryStringInfo(str, (const char *)&node->fldname[i], sizeof(TransactionId)); \
 		} \
@@ -170,10 +190,10 @@
 
 /* Write an Oid array  */
 #define WRITE_OID_ARRAY(fldname, count) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		for(i = 0; i < count; i++) \
+		for(i = 0; i < (count); i++) \
 		{ \
 			appendBinaryStringInfo(str, (const char *)&node->fldname[i], sizeof(Oid)); \
 		} \
@@ -314,11 +334,6 @@ _outPlanInfo(StringInfo str, const Plan *node)
 	WRITE_BOOL_FIELD(directDispatch.isDirectDispatch);
 	WRITE_NODE_FIELD(directDispatch.contentIds);
 
-	WRITE_INT_FIELD(nMotionNodes);
-	WRITE_INT_FIELD(nInitPlans);
-
-	WRITE_NODE_FIELD(sliceTable);
-
     WRITE_NODE_FIELD(lefttree);
     WRITE_NODE_FIELD(righttree);
     WRITE_NODE_FIELD(initPlan);
@@ -374,6 +389,8 @@ _outPlannedStmt(StringInfo str, PlannedStmt *node)
 	WRITE_NODE_FIELD(resultRelations);
 	WRITE_NODE_FIELD(utilityStmt);
 	WRITE_NODE_FIELD(subplans);
+	WRITE_INT_ARRAY(subplan_sliceIds, list_length(node->subplans) + 1, int);
+	WRITE_INT_ARRAY(subplan_initPlanParallel, list_length(node->subplans) + 1, bool);
 	WRITE_BITMAPSET_FIELD(rewindPlanIDs);
 
 	WRITE_NODE_FIELD(result_partitions);
@@ -395,6 +412,7 @@ _outPlannedStmt(StringInfo str, PlannedStmt *node)
 	WRITE_UINT64_FIELD(query_mem);
 	WRITE_NODE_FIELD(intoClause);
 	WRITE_NODE_FIELD(copyIntoClause);
+	WRITE_NODE_FIELD(refreshClause);
 	WRITE_INT8_FIELD(metricsQueryType);
 }
 
@@ -587,8 +605,6 @@ _outMotion(StringInfo str, Motion *node)
 	WRITE_NODE_FIELD(hashExprs);
 	WRITE_OID_ARRAY(hashFuncs, list_length(node->hashExprs));
 
-	WRITE_INT_FIELD(isBroadcast);
-
 	WRITE_INT_FIELD(numSortCols);
 	WRITE_INT_ARRAY(sortColIdx, node->numSortCols, AttrNumber);
 	WRITE_OID_ARRAY(sortOperators, node->numSortCols);
@@ -657,42 +673,6 @@ _outJoinExpr(StringInfo str, JoinExpr *node)
 	WRITE_NODE_FIELD(quals);
 	WRITE_NODE_FIELD(alias);
 	WRITE_INT_FIELD(rtindex);
-}
-
-/*****************************************************************************
- *
- *	Stuff from relation.h.
- *
- *****************************************************************************/
-
-static void
-_outIndexOptInfo(StringInfo str, IndexOptInfo *node)
-{
-	WRITE_NODE_TYPE("INDEXOPTINFO");
-
-	/* NB: this isn't a complete set of fields */
-	WRITE_OID_FIELD(indexoid);
-	/* Do NOT print rel field, else infinite recursion */
-	WRITE_UINT_FIELD(pages);
-	WRITE_FLOAT_FIELD(tuples, "%.0f");
-	WRITE_INT_FIELD(ncolumns);
-
-	WRITE_OID_ARRAY(opfamily, node->ncolumns);
-	WRITE_INT_ARRAY(indexkeys, node->ncolumns, int);
-	WRITE_OID_ARRAY(sortopfamily, node->ncolumns);
-
-	WRITE_BOOL_FIELD(reverse_sort);
-	WRITE_BOOL_FIELD(nulls_first);
-
-    WRITE_OID_FIELD(relam);
-	WRITE_OID_FIELD(amcostestimate);
-	WRITE_NODE_FIELD(indexprs);
-	WRITE_NODE_FIELD(indpred);
-	WRITE_BOOL_FIELD(predOK);
-	WRITE_BOOL_FIELD(unique);
-	WRITE_BOOL_FIELD(hypothetical);
-
-	WRITE_BOOL_FIELD(amoptionalkey);
 }
 
 /*****************************************************************************
@@ -1064,6 +1044,7 @@ _outConstraint(StringInfo str, Constraint *node)
 			 */
 			WRITE_BOOL_FIELD(skip_validation);
 			WRITE_BOOL_FIELD(is_no_inherit);
+			/* fallthrough */
 		case CONSTR_DEFAULT:
 			WRITE_NODE_FIELD(raw_expr);
 			WRITE_STRING_FIELD(cooked_expr);
@@ -1557,6 +1538,9 @@ _outNode(StringInfo str, void *obj)
 			case T_CopyIntoClause:
 				_outCopyIntoClause(str, obj);
 				break;
+			case T_RefreshClause:
+				_outRefreshClause(str, obj);
+				break;
 			case T_Var:
 				_outVar(str, obj);
 				break;
@@ -1701,95 +1685,10 @@ _outNode(StringInfo str, void *obj)
 			case T_OnConflictExpr:
 				_outOnConflictExpr(str, obj);
 				break;
-			case T_Path:
-				_outPath(str, obj);
-				break;
-			case T_IndexPath:
-				_outIndexPath(str, obj);
-				break;
-			case T_BitmapHeapPath:
-				_outBitmapHeapPath(str, obj);
-				break;
-			case T_BitmapAndPath:
-				_outBitmapAndPath(str, obj);
-				break;
-			case T_BitmapOrPath:
-				_outBitmapOrPath(str, obj);
-				break;
-			case T_TidPath:
-				_outTidPath(str, obj);
-				break;
-			case T_ForeignPath:
-				_outForeignPath(str, obj);
-				break;
-			case T_AppendPath:
-				_outAppendPath(str, obj);
-				break;
-			case T_MergeAppendPath:
-				_outMergeAppendPath(str, obj);
-				break;
-			case T_AppendOnlyPath:
-				_outAppendOnlyPath(str, obj);
-				break;
-			case T_AOCSPath:
-				_outAOCSPath(str, obj);
-				break;
-			case T_ResultPath:
-				_outResultPath(str, obj);
-				break;
-			case T_MaterialPath:
-				_outMaterialPath(str, obj);
-				break;
-			case T_UniquePath:
-				_outUniquePath(str, obj);
-				break;
-			case T_NestPath:
-				_outNestPath(str, obj);
-				break;
-			case T_MergePath:
-				_outMergePath(str, obj);
-				break;
-			case T_HashPath:
-				_outHashPath(str, obj);
-				break;
-            case T_CdbMotionPath:
-                _outCdbMotionPath(str, obj);
-                break;
-			case T_PlannerInfo:
-				_outPlannerInfo(str, obj);
-				break;
-			case T_PlannerParamItem:
-				_outPlannerParamItem(str, obj);
-				break;
-			case T_RelOptInfo:
-				_outRelOptInfo(str, obj);
-				break;
-			case T_IndexOptInfo:
-				_outIndexOptInfo(str, obj);
-				break;
-			case T_PathKey:
-				_outPathKey(str, obj);
-				break;
-			case T_ParamPathInfo:
-				_outParamPathInfo(str, obj);
-				break;
-			case T_RestrictInfo:
-				_outRestrictInfo(str, obj);
-				break;
-			case T_SpecialJoinInfo:
-				_outSpecialJoinInfo(str, obj);
-				break;
-			case T_LateralJoinInfo:
-				_outLateralJoinInfo(str, obj);
-				break;
-			case T_AppendRelInfo:
-				_outAppendRelInfo(str, obj);
-				break;
+
 			case T_CreateExtensionStmt:
 				_outCreateExtensionStmt(str, obj);
 				break;
-
-
 			case T_GrantStmt:
 				_outGrantStmt(str, obj);
 				break;
@@ -2270,15 +2169,6 @@ _outNode(StringInfo str, void *obj)
 				break;
 			case T_AlterTSDictionaryStmt:
 				_outAlterTSDictionaryStmt(str, obj);
-				break;
-			case T_PlaceHolderVar:
-				_outPlaceHolderVar(str, obj);
-				break;
-			case T_PlaceHolderInfo:
-				_outPlaceHolderInfo(str, obj);
-				break;
-			case T_MinMaxAggInfo:
-				_outMinMaxAggInfo(str, obj);
 				break;
 
 			case T_CookedConstraint:

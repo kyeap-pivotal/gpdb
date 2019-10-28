@@ -677,7 +677,6 @@ make_subplan(PlannerInfo *root, Query *orig_subquery,
 	if (Gp_role == GP_ROLE_DISPATCH)
 		config->is_under_subplan = true;
 
-
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
 		config->gp_cte_sharing = IsSubqueryCorrelated(subquery) ||
@@ -805,7 +804,6 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 	 */
 	splan = makeNode(SubPlan);
 	splan->subLinkType = subLinkType;
-    splan->qDispSliceId = 0;             /*CDB*/
 	splan->testexpr = NULL;
 	splan->paramIds = NIL;
 	get_first_col_type(plan, &splan->firstColType, &splan->firstColTypmod,
@@ -814,8 +812,6 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 	splan->unknownEqFalse = unknownEqFalse;
 	splan->is_initplan = false;
 	splan->is_multirow = false;
-	splan->is_parallelized = false;
-	splan->initPlanParallel = false;
 	splan->setParam = NIL;
 	splan->parParam = NIL;
 	splan->args = NIL;
@@ -873,7 +869,7 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 	 * not need to return anything useful, since the referencing Params are
 	 * elsewhere.
 	 */
-	if (splan->parParam == NIL && subLinkType == EXISTS_SUBLINK && Gp_role == GP_ROLE_DISPATCH)
+	if (splan->parParam == NIL && subLinkType == EXISTS_SUBLINK)
 	{
 		Param	   *prm;
 
@@ -883,7 +879,7 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 		splan->is_initplan = true;
 		result = (Node *) prm;
 	}
-	else if (splan->parParam == NIL && subLinkType == EXPR_SUBLINK && Gp_role == GP_ROLE_DISPATCH)
+	else if (splan->parParam == NIL && subLinkType == EXPR_SUBLINK)
 	{
 		TargetEntry *te = linitial(plan->targetlist);
 		Param	   *prm;
@@ -898,7 +894,7 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 		splan->is_initplan = true;
 		result = (Node *) prm;
 	}
-	else if (splan->parParam == NIL && subLinkType == ARRAY_SUBLINK && Gp_role == GP_ROLE_DISPATCH)
+	else if (splan->parParam == NIL && subLinkType == ARRAY_SUBLINK)
 	{
 		TargetEntry *te = linitial(plan->targetlist);
 		Oid			arraytype;
@@ -918,7 +914,7 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 		splan->is_initplan = true;
 		result = (Node *) prm;
 	}
-	else if (splan->parParam == NIL && subLinkType == ROWCOMPARE_SUBLINK && Gp_role == GP_ROLE_DISPATCH)
+	else if (splan->parParam == NIL && subLinkType == ROWCOMPARE_SUBLINK)
 	{
 		/* Adjust the Params */
 		List	   *params;
@@ -1022,16 +1018,9 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 		 * is false, then the user does not want us to materialize anything
 		 * unnecessarily, so we don't.
 		 */
-#if 0
-		/*
-		 * In GPDB, don't add a MATERIAL node here. We'll most likely add one
-		 * later anyway, when the SubPlan reference is "parallelized" in
-		 * ParallelizeCorrelatedSubPlan.
-		 */
 		else if (splan->parParam == NIL && enable_material &&
 				 !ExecMaterializesOutput(nodeTag(plan)))
-			plan = materialize_finished_plan(plan);
-#endif
+			plan = materialize_finished_plan(root, plan);
 
 		result = (Node *) splan;
 	}
@@ -3273,7 +3262,6 @@ SS_make_initplan_from_plan(PlannerInfo *root, Plan *plan,
 	node->subLinkType = EXPR_SUBLINK;
 	get_first_col_type(plan, &node->firstColType, &node->firstColTypmod,
 					   &node->firstColCollation);
-    node->qDispSliceId = 0;             /*CDB*/
 	node->plan_id = list_length(root->glob->subplans);
 	node->is_initplan = true;
 	root->init_plans = lappend(root->init_plans, node);

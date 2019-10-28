@@ -121,8 +121,23 @@ static Bitmapset *bitmapsetRead(void);
 #define READ_LOCATION_FIELD(fldname) READ_INT_FIELD(fldname)
 
 /* Read a Node field */
+#ifdef GP_SERIALIZATION_DEBUG
+#define READ_NODE_FIELD(fldname) \
+	do { \
+		char *xexpected = CppAsString(fldname); \
+		char got[100]; \
+		\
+		memcpy(got, read_str_ptr, strlen(xexpected) + 1); \
+		read_str_ptr += strlen(xexpected) + 1; \
+		if (strcmp(xexpected, got) != 0) \
+			elog(ERROR, "deserialization lost sync: %s vs %02x%02x%02x", xexpected, (unsigned char) got[0], (unsigned char) got[1], (unsigned char) got[2]); \
+		\
+		local_node->fldname = readNodeBinary(); \
+	} while(0)
+#else
 #define READ_NODE_FIELD(fldname) \
 	local_node->fldname = readNodeBinary()
+#endif
 
 /* Read a bitmapset field */
 #define READ_BITMAPSET_FIELD(fldname) \
@@ -146,11 +161,11 @@ static Bitmapset *bitmapsetRead(void);
 
 /* Read an integer array  */
 #define READ_INT_ARRAY(fldname, count, Type) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		local_node->fldname = (Type *)palloc(count * sizeof(Type)); \
-		for(i = 0; i < count; i++) \
+		local_node->fldname = (Type *)palloc((count) * sizeof(Type)); \
+		for(i = 0; i < (count); i++) \
 		{ \
 			memcpy(&local_node->fldname[i], read_str_ptr, sizeof(Type)); read_str_ptr+=sizeof(Type); \
 		} \
@@ -158,11 +173,11 @@ static Bitmapset *bitmapsetRead(void);
 
 /* Read a bool array  */
 #define READ_BOOL_ARRAY(fldname, count) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		local_node->fldname = (bool *) palloc(count * sizeof(bool)); \
-		for(i = 0; i < count; i++) \
+		local_node->fldname = (bool *) palloc((count) * sizeof(bool)); \
+		for(i = 0; i < (count); i++) \
 		{ \
 			local_node->fldname[i] = *read_str_ptr ? true : false; \
 			read_str_ptr++; \
@@ -171,11 +186,11 @@ static Bitmapset *bitmapsetRead(void);
 
 /* Read an Trasnaction ID array  */
 #define READ_XID_ARRAY(fldname, count) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		local_node->fldname = (TransactionId *)palloc(count * sizeof(TransactionId)); \
-		for(i = 0; i < count; i++) \
+		local_node->fldname = (TransactionId *)palloc((count) * sizeof(TransactionId)); \
+		for(i = 0; i < (count); i++) \
 		{ \
 			memcpy(&local_node->fldname[i], read_str_ptr, sizeof(TransactionId)); read_str_ptr+=sizeof(TransactionId); \
 		} \
@@ -185,11 +200,11 @@ static Bitmapset *bitmapsetRead(void);
 
 /* Read an Oid array  */
 #define READ_OID_ARRAY(fldname, count) \
-	if ( count > 0 ) \
+	if ( (count) > 0 ) \
 	{ \
 		int i; \
-		local_node->fldname = (Oid *)palloc(count * sizeof(Oid)); \
-		for(i = 0; i < count; i++) \
+		local_node->fldname = (Oid *)palloc((count) * sizeof(Oid)); \
+		for(i = 0; i < (count); i++) \
 		{ \
 			memcpy(&local_node->fldname[i], read_str_ptr, sizeof(Oid)); read_str_ptr+=sizeof(Oid); \
 		} \
@@ -478,6 +493,7 @@ _readConstraint(void)
 			 */
 			READ_BOOL_FIELD(skip_validation);
 			READ_BOOL_FIELD(is_no_inherit);
+			/* fallthrough */
 		case CONSTR_DEFAULT:
 			READ_NODE_FIELD(raw_expr);
 			READ_STRING_FIELD(cooked_expr);
@@ -974,7 +990,6 @@ _readSubPlan(void)
 {
 	READ_LOCALS(SubPlan);
 
-    READ_INT_FIELD(qDispSliceId);   /*CDB*/
 	READ_ENUM_FIELD(subLinkType, SubLinkType);
 	READ_NODE_FIELD(testexpr);
 	READ_NODE_FIELD(paramIds);
@@ -993,7 +1008,6 @@ _readSubPlan(void)
 	READ_NODE_FIELD(extParam);
 	READ_FLOAT_FIELD(startup_cost);
 	READ_FLOAT_FIELD(per_call_cost);
-	READ_BOOL_FIELD(initPlanParallel); /*CDB*/
 
 	READ_DONE();
 }
@@ -1135,6 +1149,7 @@ _readCreateStmt_common(CreateStmt *local_node)
 		   local_node->relKind == RELKIND_COMPOSITE_TYPE ||
 		   local_node->relKind == RELKIND_FOREIGN_TABLE ||
 		   local_node->relKind == RELKIND_UNCATALOGED ||
+		   local_node->relKind == RELKIND_MATVIEW ||
 		   IsAppendonlyMetadataRelkind(local_node->relKind));
 	Assert(local_node->oncommit <= ONCOMMIT_DROP);
 }
@@ -1430,16 +1445,6 @@ _readGrantRoleStmt(void)
 	READ_DONE();
 }
 
-static PlannerParamItem *
-_readPlannerParamItem(void)
-{
-	READ_LOCALS(PlannerParamItem);
-	READ_NODE_FIELD(item);
-	READ_INT_FIELD(paramId);
-
-	READ_DONE();
-}
-
 /*
  * _readPlannedStmt
  */
@@ -1461,6 +1466,8 @@ _readPlannedStmt(void)
 	READ_NODE_FIELD(resultRelations);
 	READ_NODE_FIELD(utilityStmt);
 	READ_NODE_FIELD(subplans);
+	READ_INT_ARRAY(subplan_sliceIds, list_length(local_node->subplans) + 1, int);
+	READ_INT_ARRAY(subplan_initPlanParallel, list_length(local_node->subplans) + 1, bool);
 	READ_BITMAPSET_FIELD(rewindPlanIDs);
 
 	READ_NODE_FIELD(result_partitions);
@@ -1481,6 +1488,7 @@ _readPlannedStmt(void)
 	READ_UINT64_FIELD(query_mem);
 	READ_NODE_FIELD(intoClause);
 	READ_NODE_FIELD(copyIntoClause);
+	READ_NODE_FIELD(refreshClause);
 	READ_INT8_FIELD(metricsQueryType);
 	READ_DONE();
 }
@@ -2297,14 +2305,11 @@ _readFlow(void)
 	READ_LOCALS(Flow);
 
 	READ_ENUM_FIELD(flotype, FlowType);
-	READ_ENUM_FIELD(req_move, Movement);
 	READ_ENUM_FIELD(locustype, CdbLocusType);
 	READ_INT_FIELD(segindex);
 	READ_INT_FIELD(numsegments);
 
-	READ_NODE_FIELD(hashExprs);
-	READ_NODE_FIELD(hashOpfamilies);
-	READ_NODE_FIELD(flow_before_req_move);
+	/* hashExprs and hashOpfamilies are omitted */
 
 	READ_DONE();
 }
@@ -2320,14 +2325,15 @@ _readMotion(void)
 	READ_INT_FIELD(motionID);
 	READ_ENUM_FIELD(motionType, MotionType);
 
-	Assert(local_node->motionType == MOTIONTYPE_FIXED || local_node->motionType == MOTIONTYPE_HASH || local_node->motionType == MOTIONTYPE_EXPLICIT);
+	Assert(local_node->motionType == MOTIONTYPE_GATHER ||
+		   local_node->motionType == MOTIONTYPE_HASH ||
+		   local_node->motionType == MOTIONTYPE_BROADCAST ||
+		   local_node->motionType == MOTIONTYPE_EXPLICIT);
 
 	READ_BOOL_FIELD(sendSorted);
 
 	READ_NODE_FIELD(hashExprs);
 	READ_OID_ARRAY(hashFuncs, list_length(local_node->hashExprs));
-
-	READ_INT_FIELD(isBroadcast);
 
 	READ_INT_FIELD(numSortCols);
 	READ_INT_ARRAY(sortColIdx, local_node->numSortCols, AttrNumber);
@@ -2369,10 +2375,13 @@ _readSplitUpdate(void)
 	READ_LOCALS(SplitUpdate);
 
 	READ_INT_FIELD(actionColIdx);
-	READ_INT_FIELD(ctidColIdx);
 	READ_INT_FIELD(tupleoidColIdx);
 	READ_NODE_FIELD(insertColIdx);
 	READ_NODE_FIELD(deleteColIdx);
+
+	READ_INT_FIELD(numHashAttrs);
+	READ_INT_ARRAY(hashAttnos, local_node->numHashAttrs, AttrNumber);
+	READ_OID_ARRAY(hashFuncs, local_node->numHashAttrs);
 
 	readPlanInfo((Plan *)local_node);
 
@@ -2487,11 +2496,6 @@ void readPlanInfo(Plan *local_node)
 	READ_INT_FIELD(dispatch);
 	READ_BOOL_FIELD(directDispatch.isDirectDispatch);
 	READ_NODE_FIELD(directDispatch.contentIds);
-
-	READ_INT_FIELD(nMotionNodes);
-	READ_INT_FIELD(nInitPlans);
-
-	READ_NODE_FIELD(sliceTable);
 
     READ_NODE_FIELD(lefttree);
     READ_NODE_FIELD(righttree);
@@ -2787,34 +2791,6 @@ _readAlterTSDictionaryStmt(void)
 	READ_DONE();
 }
 
-static PlaceHolderVar *
-_readPlaceHolderVar(void)
-{
-	READ_LOCALS(PlaceHolderVar);
-
-	READ_NODE_FIELD(phexpr);
-	READ_BITMAPSET_FIELD(phrels);
-	READ_INT_FIELD(phid);
-	READ_INT_FIELD(phlevelsup);
-
-	READ_DONE();
-}
-
-static PlaceHolderInfo *
-_readPlaceHolderInfo(void)
-{
-	READ_LOCALS(PlaceHolderInfo);
-
-	READ_INT_FIELD(phid);
-	READ_NODE_FIELD(ph_var);
-	READ_BITMAPSET_FIELD(ph_eval_at);
-	READ_BITMAPSET_FIELD(ph_lateral);
-	READ_BITMAPSET_FIELD(ph_needed);
-	READ_INT_FIELD(ph_width);
-
-	READ_DONE();
-}
-
 static CookedConstraint *
 _readCookedConstraint(void)
 {
@@ -2993,7 +2969,6 @@ _readModifyTable(void)
 	READ_INT_FIELD(exclRelRTI);
 	READ_NODE_FIELD(exclRelTlist);
 	READ_NODE_FIELD(action_col_idxes);
-	READ_NODE_FIELD(ctid_col_idxes);
 	READ_NODE_FIELD(oid_col_idxes);
 
 	READ_DONE();
@@ -3170,10 +3145,7 @@ readNodeBinary(void)
 				return_value = _readOidAssignment();
 				break;
 			case T_Plan:
-					return_value = _readPlan();
-					break;
-			case T_PlannerParamItem:
-				return_value = _readPlannerParamItem();
+				return_value = _readPlan();
 				break;
 			case T_Result:
 				return_value = _readResult();
@@ -3333,6 +3305,9 @@ readNodeBinary(void)
 				break;
 			case T_CopyIntoClause:
 				return_value = _readCopyIntoClause();
+				break;
+			case T_RefreshClause:
+				return_value = _readRefreshClause();
 				break;
 			case T_Var:
 				return_value = _readVar();
@@ -3935,12 +3910,6 @@ readNodeBinary(void)
 				break;
 			case T_AlterTSDictionaryStmt:
 				return_value = _readAlterTSDictionaryStmt();
-				break;
-			case T_PlaceHolderVar:
-				return_value = _readPlaceHolderVar();
-				break;
-			case T_PlaceHolderInfo:
-				return_value = _readPlaceHolderInfo();
 				break;
 
 			case T_CookedConstraint:

@@ -117,6 +117,15 @@ typedef struct CopyIntoClause
 	List	   *ao_segnos;		/* AO segno map */
 } CopyIntoClause;
 
+typedef struct RefreshClause
+{
+	NodeTag		type;
+
+	bool		concurrent;		/* allow concurrent access? */
+	bool		skipData;
+	RangeVar   *relation;		/* relation to insert into */
+} RefreshClause;
+
 
 /* ----------------------------------------------------------------
  *					node types for executable expressions
@@ -740,8 +749,6 @@ typedef struct SubPlan
 	Node	   *testexpr;		/* OpExpr or RowCompareExpr expression tree */
 	List	   *paramIds;		/* IDs of Params embedded in the above */
 
-    int         qDispSliceId;   /* CDB: slice# of initplan's root slice, or 0 */
-
 	/* Identification of the Plan tree to use: */
 	int			plan_id;		/* Index (from 1) in PlannedStmt.subplans */
 	/* Identification of the SubPlan for EXPLAIN and debugging purposes: */
@@ -761,7 +768,6 @@ typedef struct SubPlan
 								 * initplan? */
 	bool		is_multirow;	/* CDB: May the subplan return more than
 								 * one row? */
-	bool		is_parallelized; /* Has subplan been processed to be executed in parallel setting */
 	/* Information for passing params into and out of the subselect: */
 	/* setParam and parParam are lists of integers (param IDs) */
 	List	   *setParam;		/* initplan subqueries have to set these
@@ -772,7 +778,6 @@ typedef struct SubPlan
 	/* Estimated execution costs: */
 	Cost		startup_cost;	/* one-time setup cost */
 	Cost		per_call_cost;	/* cost for each subplan evaluation */
-	bool		initPlanParallel; /* CDB: Init plan is parallelled */
 } SubPlan;
 
 /*
@@ -1515,16 +1520,6 @@ typedef struct OnConflictExpr
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
 } OnConflictExpr;
 
-typedef enum Movement
-{
-	MOVEMENT_NONE,			/* No motion required. */
-	MOVEMENT_FOCUS,			/* Fixed motion to a single segment. */
-	MOVEMENT_BROADCAST,		/* Broadcast motion. */
-	MOVEMENT_REPARTITION,	/* Hash motion */
-	MOVEMENT_LIM_RESTRUCT,	/* Restructure a Limit node into three stages */
-	MOVEMENT_EXPLICIT		/* Move tuples to the segments specified in the segid column */
-} Movement;
-
 /*----------
  * Flow - describes a tuple flow in a parallelized plan
  *
@@ -1540,33 +1535,22 @@ typedef struct Flow
 	NodeTag		type;			/* T_Flow */
 	FlowType	flotype;		/* Type of flow produced by the plan. */
 
-	/* What motion (including none) should be applied to this Plan's output. */
-	Movement	req_move;
-
 	/* Locus type (optimizer flow characterization).
 	 */
 	CdbLocusType	locustype;
 
 	/* If flotype is FLOW_SINGLETON, then this is the segment (-1 for entry)
-	 * on which tuples occur.  If req_move is MOVEMENT_FOCUS, then this is
-	 * the desired segment for the resulting singleton flow.
+	 * on which tuples occur.
 	 */
 	int			segindex;		/* Segment index of singleton flow. */
 	int         numsegments;
 
-	/* If req_move is MOVEMENT_REPARTITION, these express the desired
-     * partitioning for a hash motion.  Else if flotype is FLOW_PARTITIONED,
-     * this is the partitioning key.  Otherwise NIL.
-	 * otherwise, they are NIL. */
+	/*
+	 * If flotype is FLOW_PARTITIONED, these are the partitioning key.
+	 * Otherwise NIL.
+	 */
 	List       *hashExprs;			/* list of hash expressions */
 	List	   *hashOpfamilies;
-
-	/* If req_move is MOVEMENT_EXPLICIT, this contains the index of the segid column
-	 * to use in the motion	 */
-	AttrNumber segidColIdx;
-
-    /* The original Flow ptr is saved here upon setting req_move. */
-    struct Flow    *flow_before_req_move;
 
 } Flow;
 

@@ -112,6 +112,8 @@ _copyPlannedStmt(const PlannedStmt *from)
 	COPY_NODE_FIELD(resultRelations);
 	COPY_NODE_FIELD(utilityStmt);
 	COPY_NODE_FIELD(subplans);
+	COPY_POINTER_FIELD(subplan_sliceIds, (list_length(from->subplans) + 1) * sizeof(int));
+	COPY_POINTER_FIELD(subplan_initPlanParallel, (list_length(from->subplans) + 1) * sizeof(bool));
 	COPY_BITMAPSET_FIELD(rewindPlanIDs);
 
 	COPY_NODE_FIELD(result_partitions);
@@ -133,6 +135,7 @@ _copyPlannedStmt(const PlannedStmt *from)
 
 	COPY_NODE_FIELD(intoClause);
 	COPY_NODE_FIELD(copyIntoClause);
+	COPY_NODE_FIELD(refreshClause);
 	COPY_SCALAR_FIELD(metricsQueryType);
 
 	return newnode;
@@ -190,9 +193,6 @@ CopyPlanFields(const Plan *from, Plan *newnode)
 	COPY_BITMAPSET_FIELD(allParam);
 	COPY_NODE_FIELD(flow);
 	COPY_SCALAR_FIELD(dispatch);
-	COPY_SCALAR_FIELD(nMotionNodes);
-	COPY_SCALAR_FIELD(nInitPlans);
-	COPY_NODE_FIELD(sliceTable);
 
 	COPY_SCALAR_FIELD(directDispatch.isDirectDispatch);
 	COPY_NODE_FIELD(directDispatch.contentIds);
@@ -329,7 +329,6 @@ _copyModifyTable(const ModifyTable *from)
 	COPY_NODE_FIELD(exclRelTlist);
 
 	COPY_NODE_FIELD(action_col_idxes);
-	COPY_NODE_FIELD(ctid_col_idxes);
 	COPY_NODE_FIELD(oid_col_idxes);
 
 	return newnode;
@@ -1357,8 +1356,6 @@ _copyMotion(const Motion *from)
 	COPY_NODE_FIELD(hashExprs);
 	COPY_POINTER_FIELD(hashFuncs, list_length(from->hashExprs) * sizeof(Oid));
 
-	COPY_SCALAR_FIELD(isBroadcast);
-
 	COPY_SCALAR_FIELD(numSortCols);
 	COPY_POINTER_FIELD(sortColIdx, from->numSortCols * sizeof(AttrNumber));
 	COPY_POINTER_FIELD(sortOperators, from->numSortCols * sizeof(Oid));
@@ -1405,10 +1402,13 @@ _copySplitUpdate(const SplitUpdate *from)
 	CopyPlanFields((Plan *) from, (Plan *) newnode);
 
 	COPY_SCALAR_FIELD(actionColIdx);
-	COPY_SCALAR_FIELD(ctidColIdx);
 	COPY_SCALAR_FIELD(tupleoidColIdx);
 	COPY_NODE_FIELD(insertColIdx);
 	COPY_NODE_FIELD(deleteColIdx);
+
+	COPY_SCALAR_FIELD(numHashAttrs);
+	COPY_POINTER_FIELD(hashAttnos, from->numHashAttrs * sizeof(AttrNumber));
+	COPY_POINTER_FIELD(hashFuncs, from->numHashAttrs * sizeof(Oid));
 
 	return newnode;
 }
@@ -1555,6 +1555,20 @@ _copyCopyIntoClause(const CopyIntoClause *from)
 	COPY_STRING_FIELD(filename);
 	COPY_NODE_FIELD(options);
 	COPY_NODE_FIELD(ao_segnos);
+
+	return newnode;
+}
+
+/*
+ * _copyRefreshClause
+ */
+static RefreshClause *
+_copyRefreshClause(const RefreshClause *from)
+{
+	RefreshClause *newnode = makeNode(RefreshClause);
+
+	COPY_SCALAR_FIELD(concurrent);
+	COPY_NODE_FIELD(relation);
 
 	return newnode;
 }
@@ -1902,7 +1916,6 @@ _copySubPlan(const SubPlan *from)
 	SubPlan    *newnode = makeNode(SubPlan);
 
 	COPY_SCALAR_FIELD(subLinkType);
-	COPY_SCALAR_FIELD(qDispSliceId);    /*CDB*/
 	COPY_NODE_FIELD(testexpr);
 	COPY_NODE_FIELD(paramIds);
 	COPY_SCALAR_FIELD(plan_id);
@@ -1920,7 +1933,6 @@ _copySubPlan(const SubPlan *from)
 	COPY_NODE_FIELD(extParam);
 	COPY_SCALAR_FIELD(startup_cost);
 	COPY_SCALAR_FIELD(per_call_cost);
-	COPY_SCALAR_FIELD(initPlanParallel);
 
 	return newnode;
 }
@@ -2400,13 +2412,11 @@ _copyFlow(const Flow *from)
 	Flow   *newnode = makeNode(Flow);
 
 	COPY_SCALAR_FIELD(flotype);
-	COPY_SCALAR_FIELD(req_move);
 	COPY_SCALAR_FIELD(locustype);
 	COPY_SCALAR_FIELD(segindex);
 	COPY_SCALAR_FIELD(numsegments);
 	COPY_NODE_FIELD(hashExprs);
 	COPY_NODE_FIELD(hashOpfamilies);
-	COPY_NODE_FIELD(flow_before_req_move);
 
 	return newnode;
 }
@@ -2502,6 +2512,7 @@ _copyRestrictInfo(const RestrictInfo *from)
 	COPY_SCALAR_FIELD(outerjoin_delayed);
 	COPY_SCALAR_FIELD(can_join);
 	COPY_SCALAR_FIELD(pseudoconstant);
+	COPY_SCALAR_FIELD(contain_outer_query_references);
 	COPY_BITMAPSET_FIELD(clause_relids);
 	COPY_BITMAPSET_FIELD(required_relids);
 	COPY_BITMAPSET_FIELD(outer_relids);
@@ -5072,6 +5083,7 @@ _copySliceTable(const SliceTable *from)
 {
 	SliceTable *newnode = makeNode(SliceTable);
 
+	COPY_BITMAPSET_FIELD(used_subplans);
 	COPY_SCALAR_FIELD(nMotions);
 	COPY_SCALAR_FIELD(nInitPlans);
 	COPY_SCALAR_FIELD(localSlice);
@@ -5535,6 +5547,9 @@ copyObject(const void *from)
 			break;
 		case T_CopyIntoClause:
 			retval = _copyCopyIntoClause(from);
+			break;
+		case T_RefreshClause:
+			retval = _copyRefreshClause(from);
 			break;
 		case T_Var:
 			retval = _copyVar(from);

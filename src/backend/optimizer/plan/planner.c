@@ -64,6 +64,7 @@
 #include "cdb/cdbpullup.h"
 #include "cdb/cdbgroup.h"		/* grouping_planner extensions */
 #include "cdb/cdbsetop.h"		/* motion utilities */
+#include "cdb/cdbtargeteddispatch.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
 #include "storage/lmgr.h"
@@ -165,6 +166,7 @@ static Plan *build_grouping_chain(PlannerInfo *root,
 								  CdbPathLocus *current_locus,
 								  List *current_pathkeys);
 
+static Plan *scatterPlan(PlannerInfo *root, Plan *result_plan, List **current_pathkeys);
 static Plan *pushdown_preliminary_limit(Plan *plan, Node *limitCount, int64 count_est, Node *limitOffset, int64 offset_est);
 
 static Plan *getAnySubplan(Plan *node);
@@ -227,6 +229,7 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	instr_time		starttime;
 	instr_time		endtime;
 	MemoryAccountIdType curMemoryAccountId;
+	bool		needToAssignDirectDispatchContentIds = false;
 
 	/*
 	 * Use ORCA only if it is enabled and we are in a master QD process.
@@ -246,13 +249,7 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		if (gp_log_optimization_time)
 			INSTR_TIME_SET_CURRENT(starttime);
 
-		curMemoryAccountId = MemoryAccounting_GetOrCreateOptimizerAccount();
-
-		START_MEMORY_ACCOUNT(curMemoryAccountId);
-		{
-			result = optimize_query(parse, boundParams);
-		}
-		END_MEMORY_ACCOUNT();
+		result = optimize_query(parse, boundParams);
 
 		if (gp_log_optimization_time)
 		{
@@ -312,6 +309,8 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	glob->lastRowMarkId = 0;
 	glob->transientPlan = false;
 	glob->oneoffPlan = false;
+	glob->nMotionNodes = 0;
+	glob->nInitPlans = 0;
 	/* ApplyShareInputContext initialization. */
 	glob->share.producers = NULL;
 	glob->share.producer_count = 0;
@@ -396,27 +395,10 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	Assert(glob->finalrowmarks == NIL);
 	Assert(glob->resultRelations == NIL);
 	Assert(parse == root->parse);
-	top_plan = set_plan_references(root, top_plan);
-	/* ... and the subplans (both regular subplans and initplans) */
-	Assert(list_length(glob->subplans) == list_length(glob->subroots));
-	forboth(lp, glob->subplans, lr, glob->subroots)
-	{
-		Plan	   *subplan = (Plan *) lfirst(lp);
-		PlannerInfo *subroot = (PlannerInfo *) lfirst(lr);
-
-		lfirst(lp) = set_plan_references(subroot, subplan);
-	}
-
-	/* walk plan and remove unused initplans and their params */
-	remove_unused_initplans(top_plan, root);
-
-	/* walk subplans and fixup subplan node referring to same plan_id */
-	SubPlanWalkerContext subplan_context;
-	fixup_subplans(top_plan, root, &subplan_context);
 
 	if (Gp_role == GP_ROLE_DISPATCH)
 	{
-		top_plan = cdbparallelize(root, top_plan, parse);
+		top_plan = cdbparallelize(root, top_plan, &needToAssignDirectDispatchContentIds);
 
 		/*
 		 * cdbparallelize() mutates all the nodes, so the producer nodes we
@@ -434,16 +416,33 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 		 */
 		top_plan = apply_shareinput_xslice(top_plan, root);
 	}
+	else
+	{
+		/*
+		 * Normally cdbparallelize() creates these, but they need to be
+		 * initialized even for completely local plans that don't need any
+		 * "parallelization"; the out/read functions expect them to be present.
+		 */
+		glob->subplan_sliceIds = palloc0((list_length(glob->subplans) + 1) * sizeof(int));
+		glob->subplan_initPlanParallel = palloc0((list_length(glob->subplans) + 1) * sizeof(bool));
+	}
 
-	/*
-	 * Remove unused subplans.
-	 * Executor initializes state for subplans even they are unused.
-	 * When the generated subplan is not used and has motion inside,
-	 * causing motionID not being assigned, which will break sanity
-	 * check when executor tries to initialize subplan state.
-	 */
-	remove_unused_subplans(root, &subplan_context);
-	bms_free(subplan_context.bms_subplans);
+	top_plan = set_plan_references(root, top_plan);
+	/* ... and the subplans (both regular subplans and initplans) */
+	Assert(list_length(glob->subplans) == list_length(glob->subroots));
+	forboth(lp, glob->subplans, lr, glob->subroots)
+	{
+		Plan	   *subplan = (Plan *) lfirst(lp);
+		PlannerInfo *subroot = (PlannerInfo *) lfirst(lr);
+
+		lfirst(lp) = set_plan_references(subroot, subplan);
+	}
+
+	if (needToAssignDirectDispatchContentIds)
+	{
+		/* figure out if we can run on a reduced set of nodes */
+		AssignContentIdsToPlanData(root, top_plan);
+	}
 
 	/* fix ShareInputScans for EXPLAIN */
 	foreach(lp, glob->subplans)
@@ -469,6 +468,8 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	result->resultRelations = glob->resultRelations;
 	result->utilityStmt = parse->utilityStmt;
 	result->subplans = glob->subplans;
+	result->subplan_sliceIds = glob->subplan_sliceIds;
+	result->subplan_initPlanParallel = glob->subplan_initPlanParallel;
 	result->rewindPlanIDs = glob->rewindPlanIDs;
 	result->result_partitions = root->result_partitions;
 	result->result_aosegnos = root->result_aosegnos;
@@ -478,8 +479,8 @@ standard_planner(Query *parse, int cursorOptions, ParamListInfo boundParams)
 	result->nParamExec = glob->nParamExec;
 	result->hasRowSecurity = glob->hasRowSecurity;
 
-	result->nMotionNodes = top_plan->nMotionNodes;
-	result->nInitPlans = top_plan->nInitPlans;
+	result->nMotionNodes = glob->nMotionNodes;
+	result->nInitPlans = glob->nInitPlans;
 	result->intoPolicy = GpPolicyCopy(parse->intoPolicy);
 	result->queryPartOids = NIL;
 	result->queryPartsMetadata = NIL;
@@ -1508,9 +1509,14 @@ inheritance_planner(PlannerInfo *root)
 			}
 			if (!locus_ok)
 			{
-				ereport(ERROR, (
-								errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("incompatible loci in target inheritance set")));
+				/*
+				 * This is reachable, if you have normal distributed/replicated tables,
+				 * and foreign tables that can only be executed in the QD, in the same
+				 * inheritance tree.
+				 */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("incompatible loci in target inheritance set")));
 			}
 		}
 
@@ -3171,6 +3177,20 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	}
 
 	/*
+	 * Deal with explicit redistribution requirements for TableValueExpr
+	 * subplans with explicit distribution.
+	 *
+	 * If there'a an ORDER BY ... LIMIT ..., we must still gather the results
+	 * to a single node to apply the LIMIT, so we do the redistribution after
+	 * those steps. But if there is an ORDER BY and no LIMIT, we 
+	 * redistribute the data before sorting, because redistributing after the
+	 * sort would destroy the order (unless it's from a single QE to multiple
+	 * receivers, but it's better to do the sorting in parallel anyway).
+	 */
+	if (parse->scatterClause && !limit_needed(parse))
+		result_plan = scatterPlan(root, result_plan, &current_pathkeys);
+
+	/*
 	 * If ORDER BY was given and we were not able to make the plan come out in
 	 * the right order, add an explicit sort step.
 	 */
@@ -3316,50 +3336,14 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 										  offset_est,
 										  count_est);
 		result_plan->flow = pull_up_Flow(result_plan, result_plan->lefttree);
-	}
 
-	/*
-	 * Deal with explicit redistribution requirements for TableValueExpr
-	 * subplans with explicit distribitution
-	 */
-	if (parse->scatterClause)
-	{
-		bool		r;
-		List	   *exprList;
-		List	   *opfamilies;
-		ListCell   *lc;
-
-		/* Deal with the special case of SCATTER RANDOMLY */
-		if (list_length(parse->scatterClause) == 1 && linitial(parse->scatterClause) == NULL)
-			exprList = NIL;
-		else
-			exprList = parse->scatterClause;
-
-		opfamilies = NIL;
-		foreach(lc, exprList)
-		{
-			Node	   *expr = lfirst(lc);
-			Oid			opfamily;
-
-			opfamily = cdb_default_distribution_opfamily_for_type(exprType(expr));
-			opfamilies = lappend_oid(opfamilies, opfamily);
-		}
 
 		/*
-		 * Repartition the subquery plan based on our distribution
-		 * requirements
+		 * If there's a SCATTER BY, redistribute the data. (If there's no
+		 * LIMIT, we did it earlier already.)
 		 */
-		r = repartitionPlan(result_plan, false, false,
-							exprList, opfamilies,
-							result_plan->flow->numsegments);
-		if (!r)
-		{
-			/*
-			 * This should not be possible, repartitionPlan should never fail
-			 * when both stable and rescannable are false.
-			 */
-			elog(ERROR, "failure repartitioning plan");
-		}
+		if (parse->scatterClause)
+			result_plan = scatterPlan(root, result_plan, &current_pathkeys);
 	}
 
 	Insist(result_plan->flow);
@@ -3377,6 +3361,48 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	return result_plan;
 }
 
+static Plan *
+scatterPlan(PlannerInfo *root, Plan *result_plan, List **current_pathkeys)
+{
+	/*
+	 * Deal with explicit redistribution requirements for TableValueExpr
+	 * subplans with explicit distribution
+	 */
+	Query	   *parse = root->parse;
+	List	   *exprList;
+	List	   *opfamilies;
+	ListCell   *lc;
+
+	if (!parse->scatterClause)
+		return result_plan;
+
+	/* Deal with the special case of SCATTER RANDOMLY */
+	if (list_length(parse->scatterClause) == 1 && linitial(parse->scatterClause) == NULL)
+		exprList = NIL;
+	else
+		exprList = parse->scatterClause;
+
+	opfamilies = NIL;
+	foreach(lc, exprList)
+	{
+		Node	   *expr = lfirst(lc);
+		Oid			opfamily;
+
+		opfamily = cdb_default_distribution_opfamily_for_type(exprType(expr));
+		opfamilies = lappend_oid(opfamilies, opfamily);
+	}
+
+	/*
+	 * Repartition the subquery plan based on our distribution
+	 * requirements
+	 */
+	result_plan = repartitionPlan(result_plan, false,
+								  exprList, opfamilies,
+								  result_plan->flow->numsegments);
+	*current_pathkeys = NIL;
+
+	return result_plan;
+}
 
 /*
  * Given a groupclause for a collection of grouping sets, produce the
@@ -3564,7 +3590,6 @@ build_grouping_chain(PlannerInfo *root,
 															sort->sortOperators,
 															sort->collations,
 															sort->nullsFirst,
-															false,
 															sort->plan.flow->numsegments);
 		}
 		else
@@ -3857,7 +3882,7 @@ is_dummy_plan_walker(Node *node, bool *context)
 			 * plan topology, even though we know they will return no rows
 			 * from a dummy.
 			 */
-			return plan_tree_walker(node, is_dummy_plan_walker, context);
+			return plan_tree_walker(node, is_dummy_plan_walker, context, true);
 
 		default:
 

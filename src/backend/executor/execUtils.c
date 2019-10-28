@@ -1259,6 +1259,7 @@ InitSliceTable(EState *estate, int nMotions, int nSubplans)
 	oldcontext = MemoryContextSwitchTo(estate->es_query_cxt);
 
 	table = makeNode(SliceTable);
+	table->used_subplans = NULL;
 	table->nMotions = nMotions;
 	table->nInitPlans = nSubplans;
 	table->slices = NIL;
@@ -1840,7 +1841,7 @@ MotionFinderWalker(Plan *node,
 	}
 
 	/* Continue walking */
-	return plan_tree_walker((Node*)node, MotionFinderWalker, ctx);
+	return plan_tree_walker((Node*)node, MotionFinderWalker, ctx, true);
 }
 
 /*
@@ -1883,22 +1884,24 @@ SubPlanFinderWalker(Plan *node,
 	if (IsA(node, SubPlan))
 	{
 		SubPlan *subplan = (SubPlan *) node;
-		int i = subplan->plan_id - 1;
-		if (!bms_is_member(i, ctx->bms_subplans))
-			ctx->bms_subplans = bms_add_member(ctx->bms_subplans, i);
+		int		plan_id = subplan->plan_id;
+
+		if (!bms_is_member(plan_id, ctx->bms_subplans))
+			ctx->bms_subplans = bms_add_member(ctx->bms_subplans, plan_id);
 		else
 			return false;
 	}
 
 	/* Continue walking */
-	return plan_tree_walker((Node*)node, SubPlanFinderWalker, ctx);
+	return plan_tree_walker((Node*)node, SubPlanFinderWalker, ctx, true);
 }
 
 /*
  * Given a plan and a root motion node find all the subplans
  * between 'root' and the next motion node in the tree
  */
-Bitmapset *getLocallyExecutableSubplans(PlannedStmt *plannedstmt, Plan *root)
+Bitmapset *
+getLocallyExecutableSubplans(PlannedStmt *plannedstmt, Plan *root)
 {
 	SubPlanFinderContext ctx;
 	Plan* root_plan = root;
@@ -1948,7 +1951,7 @@ static void ExtractSubPlanParam(SubPlan *subplan, EState *estate)
 			 * we will simply substitute the actual value from
 			 * the external parameters.
 			 */
-			if (Gp_role == GP_ROLE_EXECUTE && subplan->is_initplan)
+			if (subplan->is_initplan)
 			{
 				ParamListInfo paramInfo = estate->es_param_list_info;
 				ParamExternData *prmExt = NULL;
@@ -2006,17 +2009,21 @@ ParamExtractorWalker(Plan *node,
 	}
 
 	/* Continue walking */
-	return plan_tree_walker((Node*)node, ParamExtractorWalker, ctx);
+	return plan_tree_walker((Node*)node, ParamExtractorWalker, ctx, true);
 }
 
 /*
  * Find and extract all the InitPlan setParams in a root node's subtree.
  */
-void ExtractParamsFromInitPlans(PlannedStmt *plannedstmt, Plan *root, EState *estate)
+void
+ExtractParamsFromInitPlans(PlannedStmt *plannedstmt, Plan *root, EState *estate)
 {
 	ParamExtractorContext ctx;
-	ctx.base.node = (Node*)plannedstmt;
+
+	ctx.base.node = (Node*) plannedstmt;
 	ctx.estate = estate;
+
+	Assert(Gp_role == GP_ROLE_EXECUTE);
 
 	/* If gather motion shows up at top, we still need to find master only init plan */
 	if (IsA(root, Motion))
@@ -2078,14 +2085,14 @@ MotionAssignerWalker(Plan *node,
 	if (IsA(node, Motion))
 	{
 		ctx->motStack = lcons(node, ctx->motStack);
-		plan_tree_walker((Node *)node, MotionAssignerWalker, ctx);
+		plan_tree_walker((Node *)node, MotionAssignerWalker, ctx, true);
 		ctx->motStack = list_delete_first(ctx->motStack);
 
 		return false;
 	}
 
 	/* Continue walking */
-	return plan_tree_walker((Node*)node, MotionAssignerWalker, ctx);
+	return plan_tree_walker((Node*)node, MotionAssignerWalker, ctx, true);
 }
 
 /*
@@ -2184,6 +2191,22 @@ void AssertSliceTableIsValid(SliceTable *st, struct PlannedStmt *pstmt)
 
 		/* The n-th slice entry has sliceIndex of n */
 		Assert(s->sliceIndex == i && "slice index incorrect");
+
+		/*
+		 * FIXME: Sometimes the planner produces a plan with unused SubPlans, which
+		 * might contain Motion nodes. We remove unused SubPlans as part cdbllize(), but
+		 * there is a scenario with Append nodes where they still occur.
+		 * adjust_appendrel_attrs() makes copies of any SubPlans it encounters, which
+		 * happens early in the planning, leaving any SubPlans in target list of the
+		 * Append node to point to the original plan_id. The scan in cdbllize() doesn't
+		 * eliminate such SubPlans. But set_plan_references() will replace any SubPlans
+		 * in the Append's targetlist with references to the outputs of the child nodes,
+		 * leaving the original SubPlan unused.
+		 *
+		 * For now, just tolerate unused slices.
+		 */
+		if (s->rootIndex == -1 && s->parentIndex == -1 && s->gangType == GANGTYPE_UNALLOCATED)
+			continue;
 
 		/* The root index of a slice is either 0 or is a slice corresponding to an init plan */
 		Assert((s->rootIndex == 0) || (s->rootIndex > st->nMotions && s->rootIndex < maxIndex));

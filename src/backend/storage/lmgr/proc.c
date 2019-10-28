@@ -82,6 +82,7 @@ bool		log_lock_waits = false;
 PGPROC	   *MyProc = NULL;
 PGXACT	   *MyPgXact = NULL;
 TMGXACT	   *MyTmGxact = NULL;
+TMGXACTLOCAL	*MyTmGxactLocal = NULL;
 
 /* Special for MPP reader gangs */
 PGPROC	   *lockHolderProcPtr;
@@ -378,6 +379,9 @@ InitProcess(void)
 	}
 	MyPgXact = &ProcGlobal->allPgXact[MyProc->pgprocno];
 	MyTmGxact = &ProcGlobal->allTmGxact[MyProc->pgprocno];
+	MyTmGxactLocal = (TMGXACTLOCAL*)MemoryContextAllocZero(TopMemoryContext, sizeof(TMGXACTLOCAL));
+	if (MyTmGxactLocal == NULL)
+		elog(FATAL, "allocating TMGXACTLOCAL failed");
 
 	if (gp_debug_pgproc)
 	{
@@ -450,9 +454,25 @@ InitProcess(void)
      * over the lifetime of the entry postmaster process. A qDisp passes
      * its gp_session_id down to all of its qExecs. If this is a qExec,
      * we have already received the gp_session_id from the qDisp.
+	 *
+	 * Utility mode connections on segments should not be assigned a valid
+	 * session ID.  Otherwise, locks acquired by them may result in incorrect
+	 * determination of conflicts.  See LockCheckConflicts().
+	 *
+	 * It is ok to assign a valid session ID to a utility mode connection on
+	 * master, because session IDs are generated only on master by atomically
+	 * incrementing a counter.  Therefore, it is not possible for a utility
+	 * mode connection to be assigned the same session ID as a normal mode
+	 * connection on master.
      */
-    if (Gp_role == GP_ROLE_DISPATCH && gp_session_id == -1)
+	if (IS_QUERY_DISPATCHER() &&
+		Gp_role == GP_ROLE_DISPATCH &&
+		gp_session_id == InvalidGpSessionId)
         gp_session_id = mppLocalProcessSerial;
+
+	AssertImply(Gp_role == GP_ROLE_UTILITY && !IS_QUERY_DISPATCHER(),
+				gp_session_id == InvalidGpSessionId);
+
     MyProc->mppSessionId = gp_session_id;
     elog(DEBUG1,"InitProcess(): gp_session_id %d, Gp_role %d",gp_session_id, Gp_role);
     
@@ -501,7 +521,7 @@ InitProcess(void)
 	MyProc->queryCommandId = -1;
 
 	/* Init gxact */
-	initGxact(MyTmGxact, true);
+	resetGxact();
 
 	/*
 	 * Arrange to clean up at backend exit.
@@ -608,6 +628,9 @@ InitAuxiliaryProcess(void)
 	lockHolderProcPtr = auxproc;
 	MyPgXact = &ProcGlobal->allPgXact[auxproc->pgprocno];
 	MyTmGxact = &ProcGlobal->allTmGxact[auxproc->pgprocno];
+	MyTmGxactLocal = (TMGXACTLOCAL*)MemoryContextAllocZero(TopMemoryContext, sizeof(TMGXACTLOCAL));
+	if (MyTmGxactLocal == NULL)
+		elog(FATAL, "allocating TMGXACTLOCAL failed");
 
 	SpinLockRelease(ProcStructLock);
 
@@ -628,7 +651,7 @@ InitAuxiliaryProcess(void)
 	MyProc->databaseId = InvalidOid;
 	MyProc->roleId = InvalidOid;
     MyProc->mppLocalProcessSerial = 0;
-    MyProc->mppSessionId = 0;
+	MyProc->mppSessionId = InvalidGpSessionId;
     MyProc->mppIsWriter = false;
 	MyPgXact->delayChkpt = false;
 	MyPgXact->vacuumFlags = 0;
@@ -956,7 +979,7 @@ ProcKill(int code, Datum arg)
 
 	MyProc->localDistribXactData.state = LOCALDISTRIBXACT_STATE_NONE;
     MyProc->mppLocalProcessSerial = 0;
-    MyProc->mppSessionId = 0;
+	MyProc->mppSessionId = InvalidGpSessionId;
     MyProc->mppIsWriter = false;
 	MyProc->pid = 0;
 

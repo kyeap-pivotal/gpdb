@@ -51,10 +51,6 @@ extern const char *OptVersion();
 #endif
 
 
-/* Crude hack to avoid changing sizeof(ExplainState) in released branches */
-#define grouping_stack extra->groupingstack
-#define deparse_cxt extra->deparsecxt
-
 /* Hook for plugins to get control in ExplainOneQuery() */
 ExplainOneQuery_hook_type ExplainOneQuery_hook = NULL;
 
@@ -302,8 +298,6 @@ NewExplainState(void)
 	es->costs = true;
 	/* Prepare output buffer. */
 	es->str = makeStringInfo();
-	/* Kluge to avoid changing sizeof(ExplainState) in released branches. */
-	es->extra = (ExplainStateExtra *) palloc0(sizeof(ExplainStateExtra));
 
 	return es;
 }
@@ -741,7 +735,7 @@ ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc)
 	 */
 	if (es->analyze && !es->showstatctx->stats_gathered)
 	{
-		if (Gp_role == GP_ROLE_DISPATCH && (!es->currentSlice || sliceRunsOnQD(es->currentSlice)))
+		if (Gp_role != GP_ROLE_EXECUTE && (!es->currentSlice || sliceRunsOnQD(es->currentSlice)))
 			cdbexplain_localExecStats(queryDesc->planstate, es->showstatctx);
 
         /* Fill in the plan's Instrumentation with stats from qExecs. */
@@ -1479,26 +1473,19 @@ ExplainNode(PlanState *planstate, List *ancestors,
 
 				switch (pMotion->motionType)
 				{
+					case MOTIONTYPE_GATHER:
+						if (plan->lefttree->flow->locustype == CdbLocusType_Replicated)
+							sname = "Explicit Gather Motion";
+						else
+							sname = "Gather Motion";
+						scaleFactor = 1;
+						motion_recv = 1;
+						break;
 					case MOTIONTYPE_HASH:
 						sname = "Redistribute Motion";
 						break;
-					case MOTIONTYPE_FIXED:
-						if (pMotion->isBroadcast)
-						{
-							sname = "Broadcast Motion";
-						}
-						else if (plan->lefttree->flow->locustype == CdbLocusType_Replicated)
-						{
-							sname = "Explicit Gather Motion";
-							scaleFactor = 1;
-							motion_recv = 1;
-						}
-						else
-						{
-							sname = "Gather Motion";
-							scaleFactor = 1;
-							motion_recv = 1;
-						}
+					case MOTIONTYPE_BROADCAST:
+						sname = "Broadcast Motion";
 						break;
 					case MOTIONTYPE_EXPLICIT:
 						sname = "Explicit Redistribute Motion";
@@ -1529,8 +1516,7 @@ ExplainNode(PlanState *planstate, List *ancestors,
 						motion_snd = plan->lefttree->flow->numsegments;
 					}
 
-					if (pMotion->motionType == MOTIONTYPE_FIXED &&
-						!pMotion->isBroadcast)
+					if (pMotion->motionType == MOTIONTYPE_GATHER)
 					{
 						/* In Gather Motion always display receiver size as 1 */
 						motion_recv = 1;
@@ -1594,13 +1580,16 @@ ExplainNode(PlanState *planstate, List *ancestors,
 			appendStringInfo(es->str, "%s", plan_name);
 
 			/*
-			 * Show slice information after the plan name.
+			 * If this SubPlan is being dispatched separately, show slice
+			 * information after the plan name. Currently, we do this for
+			 * Init Plans.
 			 *
 			 * Note: If the top node was a Motion node, we print the slice
 			 * *above* the Motion here. We will print the slice below the
 			 * Motion, below.
 			 */
-			show_dispatch_info(save_currentSlice, es, plan);
+			if (es->subplanDispatchedSeparately)
+				show_dispatch_info(save_currentSlice, es, plan);
 			appendStringInfoChar(es->str, '\n');
 			es->indent++;
 		}
@@ -3474,13 +3463,17 @@ ExplainSubPlans(List *plans, List *ancestors,
 	{
 		SubPlanState *sps = (SubPlanState *) lfirst(lst);
 		SubPlan    *sp = (SubPlan *) sps->xprstate.expr;
+		int			qDispSliceId = es->pstmt->subplan_sliceIds ? es->pstmt->subplan_sliceIds[sp->plan_id] : 0;
 
 		/* Subplan might have its own root slice */
-		if (sliceTable && sp->qDispSliceId > 0)
+		if (sliceTable && qDispSliceId > 0)
 		{
 			es->currentSlice = (Slice *)list_nth(sliceTable->slices,
-												 sp->qDispSliceId);
+												 qDispSliceId);
+			es->subplanDispatchedSeparately = true;
 		}
+		else
+			es->subplanDispatchedSeparately = false;
 
 		ExplainNode(sps->planstate, ancestors,
 					relationship, sp->plan_name, es);

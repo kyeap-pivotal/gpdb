@@ -34,6 +34,10 @@
 #include "utils/timestamp.h"
 #include "storage/fd.h"
 
+#include "cdb/cdbvars.h"
+#include "cdb/cdbdisp_query.h"
+#include "cdb/cdbdispatchresult.h"
+
 
 /*
  * pg_start_backup: set up for taking an on-line backup dump
@@ -528,4 +532,45 @@ pg_backup_start_time(PG_FUNCTION_ARGS)
 								Int32GetDatum(-1));
 
 	PG_RETURN_DATUM(xtime);
+}
+
+/*
+ * gp_create_restore_point: a named point for restore
+ */
+Datum
+gp_create_restore_point(PG_FUNCTION_ARGS)
+{
+	text	   *restore_name = PG_GETARG_TEXT_P(0);
+	char	   *restore_name_str;
+	XLogRecPtr	restorepoint;
+	char *restore_command;
+
+	restore_name_str = text_to_cstring(restore_name);
+
+	if (!IS_QUERY_DISPATCHER())
+		elog(ERROR, "Must run on QD");
+
+	restore_command = psprintf("SELECT pg_catalog.pg_create_restore_point('%s')",
+								   quote_identifier(restore_name_str));
+
+	/*
+	 * Acquire TwophaseCommitLock in EXCLUSIVE mode. This is to ensure
+	 * cluster-wide restore point consistency by preventing commits from
+	 * concurrent twophase transactions where a QE segment has written
+	 * WAL.
+	 */
+	LWLockAcquire(TwophaseCommitLock, LW_EXCLUSIVE);
+
+	CdbDispatchCommand(restore_command, DF_CANCEL_ON_ERROR, NULL);
+	restorepoint = DirectFunctionCall1(pg_create_restore_point, restore_name);
+
+	LWLockRelease(TwophaseCommitLock);
+
+	pfree(restore_command);
+
+	/*
+	 * As a convenience, return the WAL location of the restore point record
+	 * GPDB TODO: Return set of records containing all LSN values.
+	 */
+	PG_RETURN_LSN(restorepoint);
 }

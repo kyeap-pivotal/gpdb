@@ -226,7 +226,7 @@ CopyDirectDispatchFromPlanToSliceTableWalker( Node *node, CopyDirectDispatchToSl
 	{
 		CopyDirectDispatchToSlice(ddPlan, sliceId, context);
 	}
-	return plan_tree_walker(node, CopyDirectDispatchFromPlanToSliceTableWalker, context);
+	return plan_tree_walker(node, CopyDirectDispatchFromPlanToSliceTableWalker, context, true);
 }
 
 static void
@@ -631,9 +631,6 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 			{
 				motionstate = getMotionState(queryDesc->planstate, LocallyExecutingSliceIndex(estate));
 				Assert(motionstate != NULL && IsA(motionstate, MotionState));
-
-				/* Patch Motion node so it looks like a top node. */
-				motionstate->ps.plan->nMotionNodes = estate->es_sliceTable->nMotions;
 			}
 
 			if (Debug_print_slice_table)
@@ -752,18 +749,16 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 
 			Assert(IsA(motionState->ps.plan, Motion));
 
-			/* update the connection information, if needed */
-			if (((PlanState *) motionState)->plan->nMotionNodes > 0)
-			{
-				ExecUpdateTransportState((PlanState *)motionState,
-										 estate->interconnect_context);
-			}
+			ExecUpdateTransportState((PlanState *) motionState,
+									 estate->interconnect_context);
 		}
 		else if (exec_identity == GP_ROOT_SLICE)
 		{
 			/* Run a root slice. */
 			if (queryDesc->planstate != NULL &&
-				queryDesc->planstate->plan->nMotionNodes > 0 && !estate->es_interconnect_is_setup)
+				queryDesc->plannedstmt->planTree->dispatch == DISPATCH_PARALLEL &&
+				queryDesc->plannedstmt->nMotionNodes > 0 &&
+				!estate->es_interconnect_is_setup)
 			{
 				Assert(!estate->interconnect_context);
 				SetupInterconnect(estate);
@@ -2022,6 +2017,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 			switch (relation->rd_rel->relkind)
 			{
 				case RELKIND_RELATION:
+				case RELKIND_MATVIEW:
 					/* OK */
 					break;
 				case RELKIND_SEQUENCE:
@@ -2094,7 +2090,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	 * ExecInitSubPlan expects to be able to find these entries.
 	 */
 	Assert(estate->es_subplanstates == NIL);
-	Bitmapset *locallyExecutableSubplans = NULL;
+	Bitmapset *locallyExecutableSubplans;
 	Plan *start_plan_node = plannedstmt->planTree;
 
 	/*
@@ -2117,8 +2113,12 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 		/* Compute SubPlans' root plan nodes for SubPlans reachable from this plan root */
 		locallyExecutableSubplans = getLocallyExecutableSubplans(plannedstmt, start_plan_node);
 	}
+	else if (estate->es_sliceTable)
+		locallyExecutableSubplans = estate->es_sliceTable->used_subplans;
+	else
+		locallyExecutableSubplans = NULL;
 
-	int subplan_idx = 0;
+	int			subplan_id = 1;
 	foreach(l, plannedstmt->subplans)
 	{
 		PlanState  *subplanstate = NULL;
@@ -2129,7 +2129,7 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 		 * If alien elimination is not turned on, then all subplans are considered
 		 * reachable.
 		 */
-		if (!estate->eliminateAliens || bms_is_member(subplan_idx, locallyExecutableSubplans))
+		if (queryDesc->ddesc == NULL || bms_is_member(subplan_id, locallyExecutableSubplans))
 		{
 			/*
 			 * A subplan will never need to do BACKWARD scan nor MARK/RESTORE.
@@ -2146,14 +2146,15 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 
 		estate->es_subplanstates = lappend(estate->es_subplanstates, subplanstate);
 
-		++subplan_idx;
+		++subplan_id;
 	}
 
-	/* No more use for locallyExecutableSubplans */
-	bms_free(locallyExecutableSubplans);
-
-	/* Extract all precomputed parameters from init plans */
-	ExtractParamsFromInitPlans(plannedstmt, plannedstmt->planTree, estate);
+	/*
+	 * If this is a query that was dispatched from the QE, extract precomputed
+	 * parameters from all init plans
+	 */
+	if (Gp_role == GP_ROLE_EXECUTE && queryDesc->ddesc)
+		ExtractParamsFromInitPlans(plannedstmt, plannedstmt->planTree, estate);
 
 	/*
 	 * Initialize the private state information for all the nodes in the query
@@ -2226,7 +2227,8 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 		queryDesc->dest = CreateCopyDestReceiver();
 		((DR_copy*)queryDesc->dest)->queryDesc = queryDesc;
 	}
-
+	else if (queryDesc->plannedstmt->refreshClause != NULL && Gp_role == GP_ROLE_EXECUTE)
+		transientrel_init(queryDesc);
 	if (DEBUG1 >= log_min_messages)
 			{
 				char		msec_str[32];
@@ -3659,27 +3661,6 @@ EvalPlanQual(EState *estate, EPQState *epqstate,
 	Assert(rti > 0);
 
 	/*
-	 * If GDD is enabled, the lock of table may downgrade to RowExclusiveLock,
-	 * (see CdbTryOpenRelation function), then EPQ would be triggered, EPQ will
-	 * execute the subplan in the executor, so it will create a new EState,
-	 * but there are no slice tables in the new EState and we can not AssignGangs
-	 * on the QE. In this case, we raise an error.
-	 */
-	if (gp_enable_global_deadlock_detector)
-	{
-		Plan *subPlan = epqstate->plan;
-
-		Assert(subPlan != NULL);
-
-		if (subPlan->nMotionNodes > 0)
-		{
-			ereport(ERROR,
-					(errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
-					 errmsg("EvalPlanQual can not handle subPlan with Motion node")));
-		}
-	}
-
-	/*
 	 * Get and lock the updated version of the row; if fail, return NULL.
 	 */
 	copyTuple = EvalPlanQualFetch(estate, relation, lockmode, LockWaitBlock,
@@ -3909,6 +3890,7 @@ EvalPlanQualFetch(EState *estate, Relation relation, int lockmode,
 
 				case HeapTupleInvisible:
 					elog(ERROR, "attempted to lock invisible tuple");
+					break;
 
 				default:
 					ReleaseBuffer(buffer);
@@ -5133,25 +5115,45 @@ FillSliceTable_walker(Node *node, void *context)
 
 		/* recurse into children */
 		cxt->currentSliceId = motion->motionID;
-		result = plan_tree_walker(node, FillSliceTable_walker, cxt);
+		result = plan_tree_walker(node, FillSliceTable_walker, cxt, true);
 		cxt->currentSliceId = parentSliceIndex;
 		return result;
 	}
 
 	if (IsA(node, SubPlan))
 	{
-		SubPlan *subplan = (SubPlan *) node;
+		SubPlan	   *subplan = (SubPlan *) node;
+		int			qDispSliceId = stmt->subplan_sliceIds[subplan->plan_id];
+		bool		recurse_into_plan;
+
+		/*
+		 * Only recurse into each subplan on first encounter. But do process
+		 * any test expressions on the SubPlan node itself, in any case. (I'm
+		 * not sure if the test expressions can actually be different on
+		 * different SubPlan references to the same subquery, but let's not
+		 * assume that they can't be.)
+		 */
+		if (!bms_is_member(subplan->plan_id, sliceTable->used_subplans))
+		{
+			sliceTable->used_subplans = bms_add_member(sliceTable->used_subplans, subplan->plan_id);
+			recurse_into_plan = true;
+		}
+		else
+			recurse_into_plan = false;
 
 		if (subplan->is_initplan)
 		{
-			cxt->currentSliceId = subplan->qDispSliceId;
-			result = plan_tree_walker(node, FillSliceTable_walker, cxt);
+			cxt->currentSliceId = qDispSliceId;
+			result = plan_tree_walker(node, FillSliceTable_walker, cxt, recurse_into_plan);
 			cxt->currentSliceId = parentSliceIndex;
-			return result;
 		}
+		else
+			result = plan_tree_walker(node, FillSliceTable_walker, cxt, recurse_into_plan);
+
+		return result;
 	}
 
-	return plan_tree_walker(node, FillSliceTable_walker, cxt);
+	return plan_tree_walker(node, FillSliceTable_walker, cxt, true);
 }
 
 /*
@@ -5176,7 +5178,7 @@ FillSliceTable(EState *estate, PlannedStmt *stmt)
 	cxt.estate = estate;
 	cxt.currentSliceId = 0;
 
-	if (stmt->intoClause != NULL || stmt->copyIntoClause != NULL)
+	if (stmt->intoClause != NULL || stmt->copyIntoClause != NULL || stmt->refreshClause)
 	{
 		Slice	   *currentSlice = (Slice *) linitial(sliceTable->slices);
 		int			numsegments;
